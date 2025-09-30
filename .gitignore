@@ -1,0 +1,53 @@
+# macOS system files
+.DS_Store
+**/.DS_Store
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+env/
+venv/
+.env
+
+# Build / distribution artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Logs and coverage
+*.log
+*.pot
+*.pyc
+*.pkl
+*.sqlite3
+*.db
+*.sql
+*.out
+*.pid
+*.gz
+*.zip
+*.tar
+*.tgz
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.cache/
+nosetests.xml
+coverage.xml
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# IDE/editor configs (optional — if you don’t want to share them)
+.vscode/
+.idea/
+*.swp
+*.swo
