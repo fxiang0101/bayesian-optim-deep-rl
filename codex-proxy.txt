@@ -1,0 +1,109 @@
+import os
+import sys
+import traceback
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse, JSONResponse
+import httpx
+import uvicorn
+
+# ============================================================================
+# Configuration
+# ============================================================================
+API_KEY = os.environ.get("COMPANY_AI_GATEWAY_KEY", "YOUR_KEY")
+CERT_PATH = os.environ.get("NODE_EXTRA_CA_CERTS")
+
+# The specific gateway endpoint your Python script used
+GATEWAY_URL = os.environ.get("GATEWAY_URL", "https://gateway.ai-npe.company.com/chat/claude-sonnet-4")
+
+if not API_KEY or not CERT_PATH:
+    print("Error: COMPANY_AI_GATEWAY_KEY and NODE_EXTRA_CA_CERTS must be set", file=sys.stderr)
+    sys.exit(1)
+
+app = FastAPI(title="Codex OpenAI-Gateway Bridge", version="1.0.0")
+
+# Initialize the async client with your company certificate
+http_client = httpx.AsyncClient(verify=CERT_PATH if CERT_PATH else True)
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    print(f"\n🔥 FATAL ERROR: {exc}\n", file=sys.stderr)
+    return JSONResponse(status_code=500, content={"error": str(exc)})
+
+# ============================================================================
+# The Pass-Through Route
+# ============================================================================
+# We use a catch-all route because OpenAI extensions might request 
+# /v1/chat/completions, /v1/models, etc. 
+@app.api_route("/{path_name:path}", methods=["GET", "POST"])
+async def proxy_openai(request: Request, path_name: str):
+    try:
+        body = await request.body()
+        
+        # 1. Inject your specific Gateway Headers
+        # Note: Using underscore 'api_key' based on your original Python script.
+        headers = {
+            "Content-Type": "application/json",
+            "api_key": API_KEY,
+            "ai_gateway_version": "v2"
+        }
+
+        # 2. Forward the exact raw payload to the Gateway
+        req = http_client.build_request(
+            method=request.method,
+            url=GATEWAY_URL, 
+            headers=headers,
+            content=body,
+            timeout=300.0
+        )
+        
+        response = await http_client.send(req, stream=True)
+        
+        # 3. Stream the exact response chunks back to the VS Code Extension
+        async def stream_generator():
+            async for chunk in response.aiter_bytes():
+                yield chunk
+
+        return StreamingResponse(
+            stream_generator(),
+            status_code=response.status_code,
+            headers={
+                # Preserve the content type (e.g., text/event-stream)
+                "Content-Type": response.headers.get("Content-Type", "application/json")
+            }
+        )
+        
+    except Exception as e:
+        print(f"\n🔥 Proxy Error:\n{traceback.format_exc()}\n", file=sys.stderr)
+        return JSONResponse(status_code=500, content={"error": f"Proxy Error: {str(e)}"})
+
+if __name__ == "__main__":
+    print("="*80)
+    print("Codex OpenAI Pass-Through Bridge Active")
+    print(f"Targeting: {GATEWAY_URL}")
+    print("="*80)
+    uvicorn.run(app, host="127.0.0.1", port=4002)
+    
+    
+================
+
+.codex/config.toml
+
+[model_providers.custom_claude]
+name = "Company Proxy"
+# The API key here doesn't matter because the proxy injects the real one
+api_key = "dummy-key" 
+
+# Point directly to the proxy port. 
+# The proxy will catch the /v1/chat/completions suffix the extension auto-appends.
+base_url = "http://127.0.0.1:4002" 
+
+model = "claude-sonnet-4"
+wire_api = "openai"
+
+
+
+then to run
+
+export COMPANY_AI_GATEWAY_KEY="your-real-key"
+export NODE_EXTRA_CA_CERTS="/path/to/your/cert.pem"
+python codex_proxy.py
