@@ -1,0 +1,518 @@
+************************
+~/litellm/config.yaml
+
+model_list:
+  - model_name: gpt-5.4
+    litellm_params:
+      model: openai/gpt-5.4
+      api_base: https://gateway.ai-npe.company.com/chat/gpt-5.4
+      api_key: os.environ/COMPANY_AI_GATEWAY_KEY
+      extra_headers:
+        api-key: os.environ/COMPANY_AI_GATEWAY_KEY
+        ai-gateway-version: "v2"
+
+litellm_settings:
+  ssl_verify: os.environ/NODE_EXTRA_CA_CERTS   # path to your corp CA bundle
+
+general_settings:
+  port: 4001
+  
+  
+export COMPANY_AI_GATEWAY_KEY=your-real-key
+export NODE_EXTRA_CA_CERTS=/path/to/your/corp-ca.pem
+litellm --config ~/litellm/config.yaml --port 4001
+
+
+Step 4 — Start LiteLLM
+bashlitellm --config ~/litellm/config.yaml --port 4001
+You should see:
+LiteLLM Proxy: Listening on http://0.0.0.0:4001
+
+
+
+Step 1 — Install LiteLLM
+bashpip install 'litellm[proxy]'
+
+Step 2 — Create ~/litellm/config.yaml
+yamlmodel_list:
+  - model_name: gpt-5.4
+    litellm_params:
+      model: openai/gpt-5.4
+      api_base: https://gateway.ai-npe.company.com/chat/gpt-5.4
+      api_key: os.environ/COMPANY_AI_GATEWAY_KEY
+      # Inject your custom gateway headers on every upstream request
+      extra_headers:
+        api-key: os.environ/COMPANY_AI_GATEWAY_KEY
+        ai-gateway-version: "v2"
+
+general_settings:
+  # LiteLLM listens here — Codex points at this
+  port: 4001
+  
+
+Step 3 — Set your environment variables
+bashexport COMPANY_AI_GATEWAY_KEY=your-real-key
+export NODE_EXTRA_CA_CERTS=/path/to/your/cert.pem
+# LiteLLM respects NODE_EXTRA_CA_CERTS for TLS verification
+
+
+Step 5 — Update ~/.codex/config.toml
+~/.codex/config.toml
+
+model          = "gpt-5.4"
+model_provider = "corp_gateway"
+
+[model_providers.corp_gateway]
+name     = "Company AI Gateway via LiteLLM"
+base_url = "http://127.0.0.1:4001"
+env_key  = "CODEX_PROXY_KEY"
+wire_api = "responses"
+
+
+Step 6 — Restart VS Code (fully quit with Cmd+Q first)
+************************
+
+
+
+"""
+proxy_server.py — localhost:4001 AI Gateway Proxy for OpenAI Codex
+===================================================================
+Fixes the "Stream disconnect before completion" / reconnecting 1/5…5/5
+error caused by broken SSE framing.
+
+Root cause of the original bug:
+  aiter_lines() strips ALL line endings, so the generator was emitting:
+      data: {...}\n        ← only one newline
+  SSE requires:
+      data: {...}\n\n      ← two newlines to close the event frame
+
+This version uses aiter_bytes() so the gateway's original byte stream
+(with correct \n\n boundaries) is forwarded verbatim.
+
+Requirements:
+    pip install fastapi "uvicorn[standard]" httpx python-dotenv
+"""
+
+import os
+import sys
+import json
+import traceback
+import logging
+from typing import AsyncGenerator
+
+import httpx
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse, JSONResponse
+
+# ─────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    stream=sys.stdout,
+)
+log = logging.getLogger("codex-proxy")
+
+# ============================================================================
+# Configuration
+# ============================================================================
+API_KEY       = os.environ.get("COMPANY_AI_GATEWAY_KEY", "YOUR_KEY")
+CERT_PATH     = os.environ.get("NODE_EXTRA_CA_CERTS")       # CA bundle for TLS verify
+DEFAULT_MODEL = "gpt-5.4"                                    # gateway model identifier
+GATEWAY_BASE  = os.environ.get(
+    "GATEWAY_BASE", "https://gateway.ai-npe.company.com/openai/v1"
+).rstrip("/")
+
+PROXY_HOST    = "127.0.0.1"
+PROXY_PORT    = 4001
+
+if not API_KEY or API_KEY == "YOUR_KEY":
+    log.error("COMPANY_AI_GATEWAY_KEY is not set — requests will likely be rejected")
+
+# ─────────────────────────────────────────────────────────────────
+# httpx client factory  (one per request to cleanly handle mTLS)
+# ─────────────────────────────────────────────────────────────────
+def _make_client() -> httpx.AsyncClient:
+    verify = CERT_PATH if CERT_PATH else True
+    return httpx.AsyncClient(
+        verify=verify,
+        timeout=httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0),
+        follow_redirects=True,
+        # Disable httpx decompression so compressed SSE is forwarded untouched
+        headers={"Accept-Encoding": "identity"},
+    )
+
+# ─────────────────────────────────────────────────────────────────
+# FastAPI app
+# ─────────────────────────────────────────────────────────────────
+app = FastAPI(title="Codex <-> AI-Gateway Proxy", version="2.0.0")
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "gateway": GATEWAY_BASE}
+
+
+@app.api_route("/{path_name:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+async def proxy_openai(request: Request, path_name: str):
+    try:
+        body = await request.body()
+
+        # ── Path normalisation ───────────────────────────────────
+        # Codex CLI/extension sometimes prepends "v1/" even when the
+        # proxy base URL already contains "/v1".  Strip it once.
+        clean_path = path_name
+        if clean_path.startswith("v1/"):
+            clean_path = clean_path[3:]
+
+        target_url = f"{GATEWAY_BASE}/{clean_path}"
+
+        # ── Detect streaming + inject default model if missing ──
+        is_stream = False
+        if body:
+            try:
+                payload = json.loads(body)
+                is_stream = bool(payload.get("stream", False))
+                # Inject DEFAULT_MODEL if Codex didn't specify one
+                if not payload.get("model"):
+                    payload["model"] = DEFAULT_MODEL
+                    body = json.dumps(payload).encode()
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        log.info("-> %s %s  stream=%s  body=%d B",
+                 request.method, target_url, is_stream, len(body))
+
+        upstream_headers = {
+            "Content-Type":       "application/json",
+            # Authorization header — set automatically by OpenAI(api_key=...) in the
+            # reference client; the proxy must replicate this explicitly.
+            "Authorization":      f"Bearer {API_KEY}",
+            # extra_headers required by the gateway — note hyphens, not underscores
+            "api-key":            API_KEY,
+            "ai-gateway-version": "v2",
+            "Accept": "text/event-stream" if is_stream else "application/json",
+        }
+
+        async with _make_client() as client:
+            if is_stream:
+                return await _handle_stream(
+                    client, request.method, target_url, upstream_headers, body
+                )
+            else:
+                return await _handle_json(
+                    client, request.method, target_url, upstream_headers, body
+                )
+
+    except httpx.ConnectError as exc:
+        log.error("Cannot reach gateway: %s", exc)
+        return JSONResponse(status_code=502,
+                            content={"error": f"Cannot connect to gateway: {exc}"})
+    except httpx.TimeoutException as exc:
+        log.error("Gateway timeout: %s", exc)
+        return JSONResponse(status_code=504, content={"error": f"Timeout: {exc}"})
+    except Exception:
+        log.error("Proxy error:\n%s", traceback.format_exc())
+        return JSONResponse(status_code=500, content={"error": "Internal proxy error"})
+
+
+# ─────────────────────────────────────────────────────────────────
+# Buffered (non-streaming) handler
+# ─────────────────────────────────────────────────────────────────
+async def _handle_json(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    headers: dict,
+    body: bytes,
+) -> JSONResponse:
+    resp = await client.request(method, url, content=body, headers=headers)
+    log.info("<- %d  %s", resp.status_code, url)
+
+    if resp.status_code != 200:
+        log.warning("Gateway error body: %s", resp.text[:500])
+        return JSONResponse(status_code=resp.status_code,
+                            content={"error": resp.text})
+    try:
+        return JSONResponse(content=resp.json(), status_code=resp.status_code)
+    except Exception:
+        return JSONResponse(content={"raw": resp.text}, status_code=resp.status_code)
+
+
+# ─────────────────────────────────────────────────────────────────
+# Streaming (SSE) handler  *** THE KEY FIX ***
+# ─────────────────────────────────────────────────────────────────
+async def _handle_stream(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    headers: dict,
+    body: bytes,
+) -> StreamingResponse:
+    """
+    Forward the SSE byte-stream verbatim from the gateway to Codex.
+
+    WHY aiter_bytes() instead of aiter_lines():
+    ─────────────────────────────────────────────
+    SSE events are delimited by a BLANK LINE (\\n\\n).
+    aiter_lines() splits on every \\n and strips endings, so you lose
+    the blank separators.  Codex's SSE parser never sees a complete
+    event frame and retries until it gives up:
+        "reconnecting 1/5 ... 5/5, stream closed before response.completion"
+
+    aiter_bytes(chunk_size) forwards the raw bytes the gateway sends,
+    preserving every \\n\\n so Codex can parse events correctly.
+    """
+    async def sse_generator() -> AsyncGenerator[bytes, None]:
+        async with client.stream(method, url, content=body, headers=headers) as resp:
+            log.info("<- stream %d  %s", resp.status_code, url)
+
+            if resp.status_code != 200:
+                err = await resp.aread()
+                err_text = err.decode("utf-8", errors="replace")
+                log.error("Gateway stream error %d: %s", resp.status_code, err_text[:300])
+                error_payload = json.dumps({
+                    "error": {"message": err_text, "code": resp.status_code}
+                })
+                # Emit as a proper SSE error event so Codex shows a message
+                # instead of silently retrying
+                yield f"data: {error_payload}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+                return
+
+            # ── Forward raw bytes verbatim ───────────────────────
+            # 32 KB chunks: efficient but small enough that Codex sees
+            # tokens promptly without buffering delays.
+            async for chunk in resp.aiter_bytes(chunk_size=32768):
+                if chunk:
+                    yield chunk
+
+    return StreamingResponse(
+        sse_generator(),
+        status_code=200,
+        media_type="text/event-stream",
+        headers={
+            # Prevent every intermediate layer from buffering the stream
+            "Cache-Control":     "no-cache, no-store",
+            "X-Accel-Buffering": "no",       # disables nginx proxy buffering
+            "Connection":        "keep-alive",
+            "Transfer-Encoding": "chunked",
+        },
+    )
+
+
+# ─────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    log.info("Starting Codex <-> Gateway proxy on %s:%d", PROXY_HOST, PROXY_PORT)
+    log.info("Gateway : %s", GATEWAY_BASE)
+    log.info("CA cert : %s", CERT_PATH or "(system default)")
+    uvicorn.run(
+        "proxy_server:app",
+        host=PROXY_HOST,
+        port=PROXY_PORT,
+        log_level="info",
+        # h11 handles SSE cleanly; httptools can coalesce chunks
+        # in ways that delay event delivery to Codex
+        http="h11",
+        # Keep connections alive between streaming tokens
+        timeout_keep_alive=305,
+    )
+
+
+++++++++++++++++++++++++++++
+
+import os
+import sys
+import traceback
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse, JSONResponse
+import httpx
+import uvicorn
+
+# ============================================================================
+# Configuration
+# ============================================================================
+API_KEY = os.environ.get("COMPANY_AI_GATEWAY_KEY", "YOUR_KEY")
+CERT_PATH = os.environ.get("NODE_EXTRA_CA_CERTS")
+
+# The specific gateway endpoint your Python script used
+GATEWAY_URL = os.environ.get("GATEWAY_URL", "https://gateway.ai-npe.company.com/chat/claude-sonnet-4")
+
+if not API_KEY or not CERT_PATH:
+    print("Error: COMPANY_AI_GATEWAY_KEY and NODE_EXTRA_CA_CERTS must be set", file=sys.stderr)
+    sys.exit(1)
+
+app = FastAPI(title="Codex OpenAI-Gateway Bridge", version="1.0.0")
+
+# Initialize the async client with your company certificate
+http_client = httpx.AsyncClient(verify=CERT_PATH if CERT_PATH else True)
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    print(f"\n🔥 FATAL ERROR: {exc}\n", file=sys.stderr)
+    return JSONResponse(status_code=500, content={"error": str(exc)})
+
+# ============================================================================
+# The Pass-Through Route
+# ============================================================================
+# We use a catch-all route because OpenAI extensions might request 
+# /v1/chat/completions, /v1/models, etc. 
+@app.api_route("/{path_name:path}", methods=["GET", "POST"])
+async def proxy_openai(request: Request, path_name: str):
+    try:
+        body = await request.body()
+        
+        # 1. Inject your specific Gateway Headers
+        # Note: Using underscore 'api_key' based on your original Python script.
+        headers = {
+            "Content-Type": "application/json",
+            "api_key": API_KEY,
+            "ai_gateway_version": "v2"
+        }
+
+        # 2. Forward the exact raw payload to the Gateway
+        req = http_client.build_request(
+            method=request.method,
+            url=GATEWAY_URL, 
+            headers=headers,
+            content=body,
+            timeout=300.0
+        )
+        
+        response = await http_client.send(req, stream=True)
+        
+        # 3. Stream the exact response chunks back to the VS Code Extension
+        async def stream_generator():
+            async for chunk in response.aiter_bytes():
+                yield chunk
+
+        return StreamingResponse(
+            stream_generator(),
+            status_code=response.status_code,
+            headers={
+                # Preserve the content type (e.g., text/event-stream)
+                "Content-Type": response.headers.get("Content-Type", "application/json")
+            }
+        )
+        
+    except Exception as e:
+        print(f"\n🔥 Proxy Error:\n{traceback.format_exc()}\n", file=sys.stderr)
+        return JSONResponse(status_code=500, content={"error": f"Proxy Error: {str(e)}"})
+
+if __name__ == "__main__":
+    print("="*80)
+    print("Codex OpenAI Pass-Through Bridge Active")
+    print(f"Targeting: {GATEWAY_URL}")
+    print("="*80)
+    uvicorn.run(app, host="127.0.0.1", port=4002)
+    
+    
+================
+
+.codex/config.toml
+
+[model_providers.custom_claude]
+name = "Company Proxy"
+# The API key here doesn't matter because the proxy injects the real one
+api_key = "dummy-key" 
+
+# Point directly to the proxy port. 
+# The proxy will catch the /v1/chat/completions suffix the extension auto-appends.
+base_url = "http://127.0.0.1:4002" 
+
+model = "claude-sonnet-4"
+wire_api = "openai"
+
+
+
+then to run
+
+export COMPANY_AI_GATEWAY_KEY="your-real-key"
+export NODE_EXTRA_CA_CERTS="/path/to/your/cert.pem"
+python codex_proxy.py
+
+
+5/16/2026
+
+import os
+import sys
+import traceback
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse, JSONResponse
+import httpx
+import uvicorn
+
+# ============================================================================
+# Configuration
+# ============================================================================
+API_KEY = os.environ.get("COMPANY_AI_GATEWAY_KEY", "YOUR_KEY")
+CERT_PATH = os.environ.get("NODE_EXTRA_CA_CERTS")
+
+# Notice this is now a BASE URL, not a full endpoint
+GATEWAY_BASE = os.environ.get("GATEWAY_BASE", "https://gateway.ai-npe.company.com/openai/v1")
+
+if not API_KEY or not CERT_PATH:
+    print("Error: COMPANY_AI_GATEWAY_KEY and NODE_EXTRA_CA_CERTS must be set", file=sys.stderr)
+    sys.exit(1)
+
+app = FastAPI(title="Codex OpenAI-Gateway Bridge", version="1.1.0")
+http_client = httpx.AsyncClient(verify=CERT_PATH if CERT_PATH else True)
+
+@app.api_route("/{path_name:path}", methods=["GET", "POST"])
+async def proxy_openai(request: Request, path_name: str):
+    try:
+        body = await request.body()
+        
+        # 1. Properly construct the full URL
+        # If extension calls /chat/completions, it appends it to the base gateway URL
+        target_url = f"{GATEWAY_BASE}/{path_name}"
+        
+        print(f"\n[Incoming Request] Routing to: {target_url}")
+
+        headers = {
+            "Content-Type": "application/json",
+            "api_key": API_KEY,
+            "ai_gateway_version": "v2"
+        }
+
+        req = http_client.build_request(
+            method=request.method,
+            url=target_url, 
+            headers=headers,
+            content=body,
+            timeout=300.0
+        )
+        
+        response = await http_client.send(req, stream=True)
+        print(f"[Gateway Response] Status Code: {response.status_code}")
+        
+        # If the gateway returned an error (like 401 or 404), don't try to stream it.
+        # Return it as plain JSON so we can see what actually went wrong.
+        if response.status_code != 200:
+            error_text = await response.aread()
+            print(f"[Gateway Error Body]: {error_text.decode('utf-8')}")
+            return JSONResponse(status_code=response.status_code, content={"error": error_text.decode('utf-8')})
+
+        # 2. CRITICAL FIX: Stream by lines, not by raw bytes. 
+        # This prevents SSE messages from being chopped in half.
+        async def stream_generator():
+            async for line in response.aiter_lines():
+                # Add the newline back that aiter_lines() strips
+                yield f"{line}\n"
+
+        return StreamingResponse(
+            stream_generator(),
+            status_code=response.status_code,
+            media_type="text/event-stream" # Force the correct streaming content type
+        )
+        
+    except Exception as e:
+        print(f"\n🔥 Proxy Error:\n{traceback.format_exc()}\n", file=sys.stderr)
+        return JSONResponse(status_code=500, content={"error": f"Proxy Error: {str(e)}"})
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=4002)
