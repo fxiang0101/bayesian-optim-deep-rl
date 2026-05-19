@@ -1,0 +1,298 @@
+"""
+proxy_server.py — localhost:4001 AI Gateway Proxy for OpenAI Codex VS Code Extension
+======================================================================================
+Strategy:
+  - Use the EXACT same OpenAI client protocol that already works against the gateway
+  - Only add SSE translation on the way back to Codex (Responses API format)
+
+Gateway protocol (unchanged, proven working):
+  client = OpenAI(
+      api_key=API_KEY,
+      base_url=GATEWAY_BASE,
+      http_client=httpx.Client(verify=CERT_PATH)
+  )
+  stream = client.chat.completions.create(
+      messages=messages,
+      model=DEFAULT_MODEL,
+      stream=True,
+      extra_headers={"api-key": API_KEY, "ai-gateway-version": "v2"}
+  )
+
+Requirements:
+    pip install fastapi "uvicorn[standard]" httpx openai
+"""
+
+import os, sys, json, traceback, logging, uuid
+import httpx, uvicorn
+from openai import OpenAI
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse, JSONResponse
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    stream=sys.stdout
+)
+log = logging.getLogger("codex-proxy")
+
+# ============================================================================
+# Configuration
+# ============================================================================
+API_KEY       = os.environ.get("COMPANY_AI_GATEWAY_KEY", "YOUR_KEY")
+CERT_PATH     = os.environ.get("NODE_EXTRA_CA_CERTS")
+DEFAULT_MODEL = "gpt-5.4"
+GATEWAY_HOST  = os.environ.get("GATEWAY_HOST", "https://gateway.ai-npe.company.com").rstrip("/")
+GATEWAY_BASE  = f"{GATEWAY_HOST}/chat/{DEFAULT_MODEL}"
+DEBUG         = os.environ.get("PROXY_DEBUG", "0") == "1"
+
+if not API_KEY or API_KEY == "YOUR_KEY":
+    log.error("COMPANY_AI_GATEWAY_KEY is not set")
+if not CERT_PATH:
+    log.error("NODE_EXTRA_CA_CERTS is not set — required for gateway TLS")
+
+# ============================================================================
+# OpenAI client — exact same protocol as the working reference
+# ============================================================================
+def _make_openai_client() -> OpenAI:
+    if not CERT_PATH:
+        raise RuntimeError("NODE_EXTRA_CA_CERTS is not set — cannot connect to gateway")
+    return OpenAI(
+        api_key=API_KEY,
+        base_url=GATEWAY_BASE,
+        http_client=httpx.Client(verify=CERT_PATH)
+    )
+
+# ============================================================================
+# FastAPI app
+# ============================================================================
+app = FastAPI()
+
+
+# ============================================================================
+# Responses API SSE event builders
+# (these are the events Codex expects to receive)
+# ============================================================================
+def _evt(event: str, data: dict) -> bytes:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
+
+def _make_response_created(response_id: str) -> bytes:
+    return _evt("response.created", {
+        "type": "response.created",
+        "sequence_number": 0,
+        "response": {
+            "id":     response_id,
+            "object": "response",
+            "model":  DEFAULT_MODEL,
+            "status": "in_progress",
+            "output": [],
+        }
+    })
+
+def _make_output_item_added(response_id: str, item_id: str) -> bytes:
+    return _evt("response.output_item.added", {
+        "type":           "response.output_item.added",
+        "sequence_number": 1,
+        "response_id":    response_id,
+        "output_index":   0,
+        "item": {
+            "id":      item_id,
+            "object":  "response.output_item",
+            "type":    "message",
+            "role":    "assistant",
+            "content": [],
+            "status":  "in_progress",
+        }
+    })
+
+def _make_content_part_added(response_id: str, item_id: str) -> bytes:
+    return _evt("response.content_part.added", {
+        "type":           "response.content_part.added",
+        "sequence_number": 2,
+        "response_id":    response_id,
+        "item_id":        item_id,
+        "output_index":   0,
+        "content_index":  0,
+        "part":           {"type": "output_text", "text": ""},
+    })
+
+def _make_text_delta(response_id: str, item_id: str, delta: str, seq: int) -> bytes:
+    return _evt("response.output_text.delta", {
+        "type":           "response.output_text.delta",
+        "sequence_number": seq,
+        "response_id":    response_id,
+        "item_id":        item_id,
+        "output_index":   0,
+        "content_index":  0,
+        "delta":          delta,
+    })
+
+def _make_text_done(response_id: str, item_id: str, full_text: str, seq: int) -> bytes:
+    return _evt("response.output_text.done", {
+        "type":           "response.output_text.done",
+        "sequence_number": seq,
+        "response_id":    response_id,
+        "item_id":        item_id,
+        "output_index":   0,
+        "content_index":  0,
+        "text":           full_text,
+    })
+
+def _make_response_done(response_id: str, full_text: str, seq: int) -> bytes:
+    return _evt("response.completed", {
+        "type":        "response.completed",
+        "sequence_number": seq,
+        "response": {
+            "id":     response_id,
+            "object": "response",
+            "model":  DEFAULT_MODEL,
+            "status": "completed",
+            "output": [{
+                "id":      f"msg_{response_id}",
+                "type":    "message",
+                "role":    "assistant",
+                "status":  "completed",
+                "content": [{"type": "output_text", "text": full_text}],
+            }],
+        }
+    })
+
+
+# ============================================================================
+# Request translator: Responses API → chat.completions.create() args
+# ============================================================================
+def _build_messages(payload: dict) -> list:
+    """Convert Responses API payload into messages list for chat.completions."""
+    messages = []
+
+    # instructions → system message
+    if payload.get("instructions"):
+        messages.append({"role": "system", "content": payload["instructions"]})
+
+    # input → user message(s)
+    raw = payload.get("input", "")
+    if isinstance(raw, str):
+        messages.append({"role": "user", "content": raw})
+    elif isinstance(raw, list):
+        for item in raw:
+            role    = item.get("role", "user")
+            content = item.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    p.get("text", "") for p in content if p.get("type") == "text"
+                )
+            messages.append({"role": role, "content": content})
+
+    return messages
+
+
+# ============================================================================
+# Main route handler
+# ============================================================================
+@app.api_route("/{path_name:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+async def proxy(request: Request, path_name: str):
+    try:
+        body       = await request.body()
+        clean_path = path_name[3:] if path_name.startswith("v1/") else path_name
+        log.info("-> %s /%s  body=%d B", request.method, clean_path, len(body))
+
+        # ── Responses API → translate and stream back to Codex ────
+        if clean_path in ("responses",):
+            payload = json.loads(body) if body else {}
+            return await _handle_responses(payload)
+
+        # ── Anything else → 404 (Codex only uses /v1/responses) ───
+        return JSONResponse(status_code=404, content={"error": f"path not handled: {clean_path}"})
+
+    except Exception:
+        log.error("Proxy error:\n%s", traceback.format_exc())
+        return JSONResponse(status_code=500, content={"error": "Internal proxy error"})
+
+
+# ============================================================================
+# Responses API handler
+# Uses the proven OpenAI client → gateway protocol, translates stream to Codex
+# ============================================================================
+async def _handle_responses(payload: dict) -> StreamingResponse:
+    messages    = _build_messages(payload)
+    response_id = f"resp_{uuid.uuid4().hex}"
+    item_id     = f"item_{uuid.uuid4().hex}"
+
+    log.info("   messages: %s", json.dumps(messages))
+
+    async def sse_generator():
+        try:
+            # ── Use EXACT working gateway protocol ─────────────────
+            client = _make_openai_client()
+            stream = client.chat.completions.create(
+                messages=messages,
+                model=DEFAULT_MODEL,
+                stream=True,
+                extra_headers={
+                    "api-key":            API_KEY,
+                    "ai-gateway-version": "v2",
+                }
+            )
+            log.info("<- stream opened successfully")
+
+            # ── Emit Responses API opening events to Codex ─────────
+            yield _make_response_created(response_id)
+            yield _make_output_item_added(response_id, item_id)
+            yield _make_content_part_added(response_id, item_id)
+
+            seq       = 3
+            full_text = ""
+
+            # ── Iterate the working stream, translate each chunk ────
+            for chunk in stream:
+                try:
+                    delta = chunk.choices[0].delta.content
+                except (IndexError, AttributeError):
+                    delta = None
+
+                if delta:
+                    full_text += delta
+                    if DEBUG:
+                        sys.stdout.write(delta)
+                        sys.stdout.flush()
+                    yield _make_text_delta(response_id, item_id, delta, seq)
+                    seq += 1
+
+            # ── Emit Responses API closing events to Codex ──────────
+            yield _make_text_done(response_id, item_id, full_text, seq)
+            yield _make_response_done(response_id, full_text, seq + 1)
+            log.info("   stream complete — %d chars", len(full_text))
+
+        except Exception:
+            log.error("Stream error:\n%s", traceback.format_exc())
+            yield _evt("response.completed", {
+                "type": "response.completed",
+                "response": {"id": response_id, "status": "failed", "output": []}
+            })
+
+    return StreamingResponse(
+        sse_generator(),
+        status_code=200,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache, no-store",
+            "X-Accel-Buffering": "no",
+            "Connection":        "keep-alive",
+        },
+    )
+
+
+# ============================================================================
+# Entry point
+# ============================================================================
+if __name__ == "__main__":
+    log.info("Starting proxy on 127.0.0.1:4001")
+    log.info("Gateway : %s", GATEWAY_BASE)
+    log.info("CA cert : %s", CERT_PATH)
+    log.info("Debug   : %s", DEBUG)
+    uvicorn.run(
+        "proxy_server:app",
+        host="127.0.0.1",
+        port=4001,
+        http="h11",
+        timeout_keep_alive=305,
+    )
